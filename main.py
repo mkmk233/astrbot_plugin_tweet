@@ -3,7 +3,10 @@ from __future__ import annotations
 import asyncio
 import html
 import re
+import socket
+import tempfile
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlparse
 from xml.etree import ElementTree as ET
@@ -19,8 +22,8 @@ from astrbot.api.star import Context, Star, register
 @register(
     "astrbot_plugin_tweet",
     "crazt",
-    "基于 RSSHub 的推文转发插件，支持内置 LLM 翻译与 BOOTH 商品信息抓取。",
-    "1.0.0",
+    "基于 RSSHub 的推文转发插件，支持内置 LLM 翻译、RSSHub 媒体兜底、动图 GIF 转换与 BOOTH 商品信息抓取。",
+    "1.1",
     "https://github.com/icrazt/astrbot_plugin_tweet",
 )
 class TweetPlugin(Star):
@@ -42,7 +45,7 @@ class TweetPlugin(Star):
             re.IGNORECASE,
         )
         self.image_url_pattern = re.compile(
-            r"https://pbs\.twimg\.com/(?:media|amplify_video_thumb|ext_tw_video_thumb)/[^\"'<>\s]+",
+            r"https://pbs\.twimg\.com/(?:media|tweet_video_thumb|amplify_video_thumb|ext_tw_video_thumb)/[^\"'<>\s]+",
             re.IGNORECASE,
         )
         self.video_url_pattern = re.compile(
@@ -141,10 +144,27 @@ class TweetPlugin(Star):
         else:
             chain = self._build_tweet_original(tweet_data, user_name)
 
+        gif_urls = [
+            u for u in tweet_data.get("gifs", [])
+            if self._is_valid_twitter_video_url(u)
+        ]
         video_urls = [
             u for u in tweet_data.get("videos", [])
             if self._is_valid_twitter_video_url(u)
         ]
+        if not self._cfg_bool("animated_gif_enabled", True):
+            # 关闭转换时完全沿用原有视频发送链路。
+            video_urls = [*gif_urls, *video_urls]
+            gif_urls = []
+        if gif_urls:
+            task = asyncio.create_task(
+                self._send_gifs_followup(
+                    umo=event.unified_msg_origin,
+                    gif_urls=gif_urls,
+                )
+            )
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
         if video_urls:
             task = asyncio.create_task(
                 self._send_videos_followup(
@@ -156,7 +176,11 @@ class TweetPlugin(Star):
             task.add_done_callback(self._background_tasks.discard)
 
         if not chain:
-            if video_urls:
+            if gif_urls and video_urls:
+                chain = [Comp.Plain("检测到动图和视频，正在发送媒体消息...")]
+            elif gif_urls:
+                chain = [Comp.Plain("检测到动图，正在转换为 GIF 并发送...")]
+            elif video_urls:
                 chain = [Comp.Plain("检测到视频，正在发送视频消息...")]
             else:
                 chain = [Comp.Plain("该推文没有可发送的文本、图片或视频。")]
@@ -227,7 +251,7 @@ class TweetPlugin(Star):
     ) -> Optional[dict[str, Any]]:
         logger.debug(f"tweet plugin: fetching RSS data from {rss_url}")
         timeout = aiohttp.ClientTimeout(total=self._cfg_int("request_timeout_sec", 20))
-        headers = {"User-Agent": "astrbot-plugin-tweet/1.0.0"}
+        headers = {"User-Agent": "astrbot-plugin-tweet/1.1"}
 
         try:
             async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
@@ -272,20 +296,169 @@ class TweetPlugin(Star):
                 continue
 
             raw_content = item.findtext("description") or ""
-            text, image_urls, video_urls = self._extract_text_images_videos(raw_content)
-            return {
+            text, image_urls, gif_urls, video_urls = (
+                self._extract_text_images_videos(raw_content)
+            )
+            tweet_data = {
                 "text": text,
                 "images": image_urls,
+                "gifs": gif_urls,
                 "videos": video_urls,
                 "pub_date": item.findtext("pubDate") or "",
                 "author": item.findtext("author") or "",
             }
+            return await self._enrich_tweet_media_from_fxtwitter(
+                tweet_data,
+                original_user,
+                original_tweet_id,
+            )
         return None
+
+    async def _enrich_tweet_media_from_fxtwitter(
+        self,
+        tweet_data: dict[str, Any],
+        user_name: str,
+        tweet_id: str,
+    ) -> dict[str, Any]:
+        """Supplement incomplete RSSHub media metadata.
+
+        Some RSSHub instances only include the static ``tweet_video_thumb`` for a
+        Twitter animated GIF.  In that case the RSS item contains no
+        ``video.twimg.com/tweet_video`` URL and the old implementation had no way
+        to know that the media was animated.  Querying fxtwitter here keeps the
+        RSSHub path intact while recovering the real animated media URL.
+        """
+        if not self._cfg_bool("fxtwitter_media_fallback_enabled", True):
+            return tweet_data
+        if tweet_data.get("gifs") or tweet_data.get("videos"):
+            # RSSHub 常同时给出真实视频地址和静态封面。移除封面，避免
+            # 已经发送动画后又重复发送一张看似静态的图片。
+            tweet_data["images"] = [
+                image_url
+                for image_url in tweet_data.get("images") or []
+                if not self._is_video_thumbnail_url(image_url)
+            ]
+            return tweet_data
+        image_urls = list(tweet_data.get("images") or [])
+        if not any(self._is_video_thumbnail_url(url) for url in image_urls):
+            return tweet_data
+
+        api_url = f"https://api.fxtwitter.com/{user_name}/status/{tweet_id}"
+        timeout = aiohttp.ClientTimeout(
+            total=self._cfg_int("request_timeout_sec", 20),
+        )
+        headers = {
+            "User-Agent": "astrbot-plugin-tweet/1.1",
+            # fxtwitter may negotiate Brotli; avoid requiring an optional
+            # brotli decoder in the host AstrBot environment.
+            "Accept-Encoding": "identity",
+        }
+        try:
+            async with aiohttp.ClientSession(
+                timeout=timeout,
+                headers=headers,
+            ) as session:
+                async with session.get(api_url) as response:
+                    if response.status >= 400:
+                        logger.debug(
+                            "tweet plugin: fxtwitter media fallback HTTP %s for %s",
+                            response.status,
+                            api_url,
+                        )
+                        return tweet_data
+                    payload = await response.json(content_type=None)
+        except Exception as exc:
+            logger.debug(
+                "tweet plugin: fxtwitter media fallback failed for %s - %s",
+                api_url,
+                exc,
+            )
+            return tweet_data
+
+        tweet = payload.get("tweet") if isinstance(payload, dict) else None
+        media = tweet.get("media") if isinstance(tweet, dict) else None
+        media_items = media.get("all") if isinstance(media, dict) else None
+        if not isinstance(media_items, list):
+            return tweet_data
+
+        gif_urls = list(tweet_data.get("gifs") or [])
+        video_urls = list(tweet_data.get("videos") or [])
+        media_refs: list[tuple[str, str]] = []
+
+        for media_item in media_items:
+            if not isinstance(media_item, dict):
+                continue
+            media_url = str(media_item.get("url") or "").strip()
+            media_type = str(media_item.get("type") or "").strip().lower()
+            thumbnail_url = str(media_item.get("thumbnail_url") or "").strip()
+            if not self._is_valid_twitter_video_url(media_url):
+                continue
+            if media_type == "gif":
+                gif_urls.append(media_url)
+            elif media_type == "video":
+                video_urls.append(media_url)
+            else:
+                continue
+            media_refs.append((media_url, thumbnail_url))
+
+        if not media_refs:
+            return tweet_data
+
+        filtered_images = [
+            image_url
+            for image_url in image_urls
+            if not any(
+                self._is_related_video_thumbnail(
+                    image_url,
+                    media_url,
+                    thumbnail_url,
+                )
+                for media_url, thumbnail_url in media_refs
+            )
+        ]
+        tweet_data["images"] = self._dedup_urls(filtered_images)
+        tweet_data["gifs"] = self._dedup_urls(gif_urls)
+        tweet_data["videos"] = self._dedup_urls(video_urls)
+        logger.info(
+            "tweet plugin: fxtwitter media fallback recovered %d GIF(s), %d video(s) for %s",
+            len(tweet_data["gifs"]),
+            len(tweet_data["videos"]),
+            api_url,
+        )
+        return tweet_data
+
+    def _is_video_thumbnail_url(self, image_url: str) -> bool:
+        image_path = urlparse(image_url).path.lower()
+        return any(
+            marker in image_path
+            for marker in (
+                "/tweet_video_thumb/",
+                "/amplify_video_thumb/",
+                "/ext_tw_video_thumb/",
+            )
+        )
+
+    def _is_related_video_thumbnail(
+        self,
+        image_url: str,
+        media_url: str,
+        thumbnail_url: str = "",
+    ) -> bool:
+        if thumbnail_url and image_url.split("?", 1)[0] == thumbnail_url.split("?", 1)[0]:
+            return True
+
+        if not self._is_video_thumbnail_url(image_url):
+            return False
+
+        image_path = urlparse(image_url).path.lower()
+        image_stem = Path(image_path).stem
+        media_stem = Path(urlparse(media_url).path.lower()).stem
+        return bool(image_stem and image_stem == media_stem)
 
     async def _resolve_twitter_link(self, tweet_id: str) -> Optional[tuple[str, str]]:
         api_url = f"https://api.vxtwitter.com/i/status/{tweet_id}"
         timeout = aiohttp.ClientTimeout(total=self._cfg_int("request_timeout_sec", 20))
-        headers = {"User-Agent": "astrbot-plugin-tweet/1.0.0"}
+        headers = {"User-Agent": "astrbot-plugin-tweet/1.1"}
 
         try:
             async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
@@ -310,7 +483,7 @@ class TweetPlugin(Star):
         booth_locale = self._cfg_str("booth_locale", "zh-cn")
         api_url = f"https://booth.pm/{booth_locale}/items/{item_id}.json"
         timeout = aiohttp.ClientTimeout(total=self._cfg_int("request_timeout_sec", 20))
-        headers = {"User-Agent": "astrbot-plugin-tweet/1.0.0"}
+        headers = {"User-Agent": "astrbot-plugin-tweet/1.1"}
 
         try:
             async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
@@ -330,16 +503,305 @@ class TweetPlugin(Star):
 
     async def _send_videos_followup(self, umo: str, video_urls: list[str]) -> None:
         for video_url in video_urls:
-            try:
-                ok = await self.context.send_message(
-                    umo,
-                    MessageChain(chain=[Comp.Video.fromURL(video_url)]),
-                )
-                if not ok:
-                    logger.warning(f"tweet plugin: 无法发送视频消息，找不到会话: {umo}")
-            except Exception as exc:
-                logger.warning(f"tweet plugin: 发送视频消息失败 {video_url} - {exc}")
+            await self._send_video_followup_item(umo, video_url)
             await asyncio.sleep(0.8)
+
+    async def _send_video_followup_item(self, umo: str, video_url: str) -> None:
+        try:
+            ok = await self.context.send_message(
+                umo,
+                MessageChain(chain=[Comp.Video.fromURL(video_url)]),
+            )
+            if not ok:
+                logger.warning(f"tweet plugin: 无法发送视频消息，找不到会话: {umo}")
+        except Exception as exc:
+            logger.warning(f"tweet plugin: 发送视频消息失败 {video_url} - {exc}")
+
+    async def _send_gifs_followup(self, umo: str, gif_urls: list[str]) -> None:
+        for gif_url in gif_urls:
+            await self._send_gif_followup_item(umo, gif_url)
+            await asyncio.sleep(0.8)
+
+    async def _send_gif_followup_item(self, umo: str, video_url: str) -> None:
+        if not self._cfg_bool("animated_gif_enabled", True):
+            await self._send_video_followup_item(umo, video_url)
+            return
+
+        with tempfile.TemporaryDirectory(prefix="astrbot_tweet_gif_") as temp_dir:
+            source_path = Path(temp_dir) / "source.mp4"
+            gif_path = Path(temp_dir) / "animated.gif"
+
+            converted = False
+            if self._cfg_bool("fxtwitter_gif_proxy_enabled", True):
+                converted = await self._download_fxtwitter_gif(video_url, gif_path)
+                if converted:
+                    logger.info(
+                        "tweet plugin: 已通过 fxtwitter GIF CDN 获取动图，跳过 MP4 直连转换",
+                    )
+
+            if not converted:
+                downloaded = await self._download_twitter_video(video_url, source_path)
+                converted = downloaded and await self._convert_video_file_to_gif(
+                    source_path,
+                    gif_path,
+                )
+            if not converted:
+                logger.warning(
+                    f"tweet plugin: 动图获取/转换失败，回退发送原 MP4: {video_url}",
+                )
+                await self._send_video_followup_item(umo, video_url)
+                return
+
+            sent = False
+            try:
+                sent = await self.context.send_message(
+                    umo,
+                    MessageChain(chain=[Comp.Image.fromFileSystem(gif_path)]),
+                )
+                if not sent:
+                    logger.warning(f"tweet plugin: 无法发送 GIF 消息，找不到会话: {umo}")
+            except Exception as exc:
+                logger.warning(f"tweet plugin: 发送 GIF 消息失败 {video_url} - {exc}")
+
+            if not sent:
+                logger.warning(f"tweet plugin: GIF 消息未成功发送，回退发送原 MP4: {video_url}")
+                await self._send_video_followup_item(umo, video_url)
+
+    async def _download_twitter_video(
+        self,
+        video_url: str,
+        output_path: Path,
+    ) -> bool:
+        timeout = aiohttp.ClientTimeout(total=self._cfg_int("request_timeout_sec", 20))
+        headers = {"User-Agent": "astrbot-plugin-tweet/1.1"}
+
+        try:
+            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+                async with session.get(video_url) as response:
+                    if response.status >= 400:
+                        logger.warning(
+                            f"tweet plugin: 下载动图 MP4 HTTP {response.status}: {video_url}",
+                        )
+                        return False
+                    with output_path.open("wb") as output_file:
+                        async for chunk in response.content.iter_chunked(64 * 1024):
+                            output_file.write(chunk)
+        except Exception as exc:
+            logger.warning(f"tweet plugin: 下载动图 MP4 失败 {video_url} - {exc}")
+            return False
+
+        if output_path.stat().st_size == 0:
+            logger.warning(f"tweet plugin: 下载的动图 MP4 为空: {video_url}")
+            return False
+        return True
+
+    def _build_fxtwitter_gif_url(self, video_url: str) -> str:
+        """将 Twitter animated_gif 的 MP4 地址映射到 fxtwitter GIF CDN。"""
+        parsed = urlparse(video_url)
+        if (
+            parsed.scheme != "https"
+            or parsed.netloc.lower() != "video.twimg.com"
+            or not parsed.path.lower().startswith("/tweet_video/")
+        ):
+            return ""
+
+        gif_path = re.sub(
+            r"\.(?:mp4|m4v)$",
+            ".gif",
+            parsed.path,
+            flags=re.IGNORECASE,
+        )
+        if not gif_path.lower().endswith(".gif"):
+            return ""
+        return f"https://gif.fxtwitter.com{gif_path}"
+
+    async def _download_fxtwitter_gif(
+        self,
+        video_url: str,
+        output_path: Path,
+    ) -> bool:
+        """通过 fxtwitter CDN 获取已转换 GIF，绕过部分网络下的 twimg 不可达。"""
+        gif_url = self._build_fxtwitter_gif_url(video_url)
+        if not gif_url:
+            return False
+
+        timeout = aiohttp.ClientTimeout(total=self._cfg_int("request_timeout_sec", 20))
+        headers = {
+            "User-Agent": "astrbot-plugin-tweet/1.1",
+            "Accept-Encoding": "identity",
+        }
+        try:
+            # 该 CDN 同时公布 IPv4/IPv6；部分国内网络下 IPv6 会先超时，
+            # 强制 IPv4 可显著缩短首包等待并避免误判 CDN 不可用。
+            connector = aiohttp.TCPConnector(family=socket.AF_INET)
+            async with aiohttp.ClientSession(
+                timeout=timeout,
+                headers=headers,
+                connector=connector,
+            ) as session:
+                async with session.get(gif_url) as response:
+                    if response.status >= 400:
+                        logger.debug(
+                            "tweet plugin: fxtwitter GIF HTTP %s: %s",
+                            response.status,
+                            gif_url,
+                        )
+                        return False
+                    with output_path.open("wb") as output_file:
+                        async for chunk in response.content.iter_chunked(64 * 1024):
+                            output_file.write(chunk)
+        except Exception as exc:
+            logger.debug(
+                "tweet plugin: fxtwitter GIF 下载失败 %s - %s",
+                gif_url,
+                exc,
+            )
+            return False
+
+        if output_path.stat().st_size == 0:
+            logger.debug(f"tweet plugin: fxtwitter GIF 为空: {gif_url}")
+            return False
+        if not self._is_animated_gif_file(output_path):
+            logger.warning(f"tweet plugin: fxtwitter 返回的文件不是有效动画 GIF: {gif_url}")
+            return False
+        logger.info(
+            "tweet plugin: fxtwitter GIF 下载完成 size=%d url=%s",
+            output_path.stat().st_size,
+            gif_url,
+        )
+        return True
+
+    async def _convert_video_file_to_gif(
+        self,
+        source_path: Path,
+        output_path: Path,
+    ) -> bool:
+        try:
+            import imageio_ffmpeg
+
+            ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception as exc:
+            logger.warning(
+                f"tweet plugin: 无法加载内置 FFmpeg，请重新安装插件依赖: {exc}",
+            )
+            return False
+
+        fps = max(1, min(self._cfg_int("animated_gif_fps", 12), 30))
+        max_width = max(0, self._cfg_int("animated_gif_max_width", 480))
+        max_duration = max(0, self._cfg_int("animated_gif_max_duration_sec", 15))
+
+        video_filters = [f"fps={fps}"]
+        if max_width:
+            video_filters.append(
+                f"scale=w='min({max_width},iw)':h=-2:flags=lanczos",
+            )
+        video_filters.append(
+            "split[s0][s1];[s0]palettegen=stats_mode=diff[p];"
+            "[s1][p]paletteuse=dither=sierra2_4a:diff_mode=rectangle",
+        )
+
+        command = [
+            ffmpeg_path,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(source_path),
+        ]
+        if max_duration:
+            command.extend(["-t", str(max_duration)])
+        command.extend(
+            [
+                "-vf",
+                ",".join(video_filters),
+                "-an",
+                "-loop",
+                "0",
+                str(output_path),
+            ]
+        )
+
+        timeout_sec = max(
+            self._cfg_int("animated_gif_convert_timeout_sec", 120),
+            30,
+        )
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=timeout_sec,
+            )
+        except asyncio.TimeoutError:
+            try:
+                process.kill()
+                await process.wait()
+            except Exception:
+                pass
+            logger.warning(f"tweet plugin: GIF 转换超时 ({timeout_sec}s): {source_path.name}")
+            return False
+        except Exception as exc:
+            logger.warning(f"tweet plugin: 启动 GIF 转换失败: {exc}")
+            return False
+
+        if process.returncode != 0:
+            error_text = stderr.decode(errors="replace").strip()
+            logger.warning(
+                f"tweet plugin: FFmpeg GIF 转换失败 ({process.returncode}): {error_text}",
+            )
+            return False
+        if not output_path.exists() or output_path.stat().st_size == 0:
+            logger.warning("tweet plugin: FFmpeg 未生成有效的 GIF 文件")
+            return False
+        if not self._is_animated_gif_file(output_path):
+            logger.warning("tweet plugin: FFmpeg 输出不是有效的多帧 GIF，拒绝按 GIF 发送")
+            return False
+        return True
+
+    def _is_animated_gif_file(self, gif_path: Path) -> bool:
+        try:
+            with gif_path.open("rb") as gif_file:
+                signature = gif_file.read(6)
+        except OSError as exc:
+            logger.warning(f"tweet plugin: 无法读取待发送 GIF: {exc}")
+            return False
+
+        if signature not in (b"GIF87a", b"GIF89a"):
+            logger.warning("tweet plugin: GIF 文件头无效")
+            return False
+
+        # AstrBot normally ships Pillow; if it is unavailable still allow a
+        # file with a valid GIF signature because FFmpeg already produced it.
+        try:
+            from PIL import Image
+        except ImportError:
+            return True
+
+        try:
+            with Image.open(gif_path) as image:
+                frames = int(getattr(image, "n_frames", 1))
+                is_animated = bool(getattr(image, "is_animated", False))
+                if image.format != "GIF" or frames <= 1 or not is_animated:
+                    logger.warning(
+                        "tweet plugin: GIF 校验失败 format=%s frames=%d animated=%s",
+                        image.format,
+                        frames,
+                        is_animated,
+                    )
+                    return False
+                logger.info(
+                    "tweet plugin: 已生成可动画 GIF frames=%d size=%s",
+                    frames,
+                    image.size,
+                )
+                return True
+        except Exception as exc:
+            logger.warning(f"tweet plugin: 无法校验 GIF 动画属性: {exc}")
+            return False
 
     async def _translate_text(
         self,
@@ -441,7 +903,7 @@ class TweetPlugin(Star):
 
         api_url = "https://translate.googleapis.com/translate_a/single"
         timeout = aiohttp.ClientTimeout(total=self._cfg_int("request_timeout_sec", 20))
-        headers = {"User-Agent": "astrbot-plugin-tweet/1.0.0"}
+        headers = {"User-Agent": "astrbot-plugin-tweet/1.1"}
         params = {
             "client": "gtx",
             "sl": "auto",
@@ -674,16 +1136,24 @@ class TweetPlugin(Star):
     def _extract_text_images_videos(
         self,
         content: str,
-    ) -> tuple[str, list[str], list[str]]:
+    ) -> tuple[str, list[str], list[str], list[str]]:
         content = html.unescape(content or "")
 
         image_urls = [
             u for u in self._dedup_urls(self.image_url_pattern.findall(content))
             if self._is_valid_twitter_media_url(u)
         ]
-        video_urls = [
+        media_video_urls = [
             u for u in self._dedup_urls(self.video_url_pattern.findall(content))
             if self._is_valid_twitter_video_url(u)
+        ]
+        gif_urls = [
+            u for u in media_video_urls
+            if self._is_twitter_animated_gif_url(u)
+        ]
+        video_urls = [
+            u for u in media_video_urls
+            if not self._is_twitter_animated_gif_url(u)
         ]
 
         cleaned = self.image_url_pattern.sub(" ", content)
@@ -698,7 +1168,7 @@ class TweetPlugin(Star):
                 lines.append(line)
         text = "\n".join(lines)
 
-        return text, image_urls, video_urls
+        return text, image_urls, gif_urls, video_urls
 
     def _extract_booth_images(self, booth_data: dict[str, Any]) -> list[str]:
         images = booth_data.get("images", [])
@@ -769,6 +1239,12 @@ class TweetPlugin(Star):
         if parsed.scheme not in {"http", "https"}:
             return False
         return parsed.netloc.lower() == "video.twimg.com" and bool(parsed.path.strip("/"))
+
+    def _is_twitter_animated_gif_url(self, url: str) -> bool:
+        if not self._is_valid_twitter_video_url(url):
+            return False
+        # Twitter/X 会把上传的 GIF 转码为 video.twimg.com/tweet_video/*.mp4。
+        return "/tweet_video/" in urlparse(url).path.lower()
 
     def _dedup_urls(self, urls: list[str]) -> list[str]:
         result: list[str] = []

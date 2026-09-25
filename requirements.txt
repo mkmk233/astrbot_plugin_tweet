@@ -1,0 +1,2 @@
+# 提供跨平台的 FFmpeg 可执行文件，用于把推特 animated_gif 的 MP4 转成 GIF。
+imageio-ffmpeg>=0.6.0,<0.7

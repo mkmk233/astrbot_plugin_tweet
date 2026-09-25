@@ -46,10 +46,56 @@
     "hint": "默认关闭，避免识别误判导致跳过翻译。",
     "default": false
   },
+  "fxtwitter_media_fallback_enabled": {
+    "description": "RSSHub 未提供动图/视频真实地址时，使用 fxtwitter 媒体元数据兜底。",
+    "type": "bool",
+    "hint": "默认开启。部分 RSSHub 实例只给静态封面；开启后可识别真正的 animated_gif，并移除对应静态封面。",
+    "default": true
+  },
+  "animated_gif_enabled": {
+    "description": "是否把推特动图（animated_gif）转换为 GIF 图片后转发。",
+    "type": "bool",
+    "hint": "关闭后将保持原行为，直接转发推特提供的 MP4。转换失败时也会自动回退到 MP4。",
+    "default": true
+  },
+  "fxtwitter_gif_proxy_enabled": {
+    "description": "优先通过 fxtwitter GIF CDN 获取推特动图。",
+    "type": "bool",
+    "hint": "默认开启，可绕过 video.twimg.com 在部分网络下不可达的问题；失败后仍会尝试下载 MP4 本地转换，再回退原 MP4。",
+    "default": true
+  },
+  "animated_gif_fps": {
+    "description": "转换 GIF 时的帧率。",
+    "type": "int",
+    "hint": "范围 1-30，默认 12；帧率越高越流畅，文件也越大。",
+    "default": 12
+  },
+  "animated_gif_max_width": {
+    "description": "转换 GIF 时限制的最大宽度（像素）。",
+    "type": "int",
+    "hint": "默认 480；设置为 0 表示保持原始分辨率。",
+    "default": 480
+  },
+  "animated_gif_max_duration_sec": {
+    "description": "转换 GIF 时保留的最大时长（秒）。",
+    "type": "int",
+    "hint": "默认 15；设置为 0 表示保留完整时长。",
+    "default": 15
+  },
+  "animated_gif_convert_timeout_sec": {
+    "description": "单个动图转换为 GIF 的超时时间（秒）。",
+    "type": "int",
+    "hint": "默认 120，实际使用值最低为 30 秒。",
+    "default": 120
+  },
   "booth_locale": {
     "description": "BOOTH 商品接口语言区域。",
     "type": "string",
-    "options": ["zh-cn", "ja", "en"],
+    "options": [
+      "zh-cn",
+      "ja",
+      "en"
+    ],
     "default": "zh-cn"
   },
   "request_timeout_sec": {
