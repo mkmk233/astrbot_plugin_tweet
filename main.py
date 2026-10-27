@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import html
+import io
+import json
 import re
 import socket
 import tempfile
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -23,7 +26,7 @@ from astrbot.api.star import Context, Star, register
     "astrbot_plugin_tweet",
     "crazt",
     "基于 RSSHub 的推文转发插件，支持内置 LLM 翻译、RSSHub 媒体兜底、动图 GIF 转换与 BOOTH 商品信息抓取。",
-    "1.1",
+    "1.2.0",
     "https://github.com/icrazt/astrbot_plugin_tweet",
 )
 class TweetPlugin(Star):
@@ -31,6 +34,8 @@ class TweetPlugin(Star):
         super().__init__(context)
         self.config = config
         self._background_tasks: set[asyncio.Task] = set()
+        self._cache_lock = asyncio.Lock()
+        self._cache_path: Optional[Path] = None
 
         self.twitter_link_pattern = re.compile(
             r"https?://(?:x\.com|twitter\.com)/([A-Za-z0-9_]+)/status/(\d+)",
@@ -64,26 +69,42 @@ class TweetPlugin(Star):
             tweet_results, translate_text = tweet_info
             event.should_call_llm(False)
 
-            if not translate_text:
-                for result in tweet_results:
-                    result.stop_event()
-                    yield result
-            else:
-                umo = event.unified_msg_origin
+            umo = event.unified_msg_origin
+            translate_task: Optional[asyncio.Task] = None
+            if translate_text:
                 # 并发：立即启动翻译请求，同时发送原文
                 translate_task = asyncio.create_task(
                     self._translate_text(umo=umo, text=translate_text)
                 )
-                for result in tweet_results:
-                    await self.context.send_message(umo, result)
+
+            # 以前"原文无文字"的推文直接 yield 给 respond 阶段发送，插件拿不到
+            # 发送结果：NapCat 超时（retcode=1200）时消息根本进不了群，却没有任何
+            # 兜底。这里和带文字的分支统一成"插件自发送 + 失败改发卡片图片"。
+            for result in tweet_results:
+                chain = MessageChain(chain=list(getattr(result, "chain", []) or []))
+                if not chain.chain:
+                    continue
+                try:
+                    await self.context.send_message(umo, chain)
+                except Exception as exc:
+                    # 平台/客户端拒收或超时：改用渲染好的单张图片再试一次
+                    logger.warning(
+                        f"tweet plugin: 原文发送失败，尝试改发图片兜底: {exc}"
+                    )
+                    self._schedule_card_fallback(event, reason="send_failed")
+                    break
+
+            if translate_task is not None:
                 # 原文已发送，等待翻译完成后发送
                 try:
                     translated = await translate_task
                     if translated:
-                        await self.context.send_message(umo, MessageChain().message(translated))
+                        await self.context.send_message(
+                            umo, MessageChain().message(translated)
+                        )
                 except Exception as exc:
                     logger.warning(f"tweet plugin: 翻译失败: {exc}")
-                event.stop_event()
+            event.stop_event()
             return
 
         booth_results = await self._handle_booth_link(event, text)
@@ -123,6 +144,15 @@ class TweetPlugin(Star):
                 return ([event.plain_result("未能解析推文链接。")], None)
             user_name, original_link = resolved
 
+        # 1 天内处理过的推文直接复用缓存（原文 + 译文），跳过 RSSHub 和翻译
+        if command is None and self._cfg_bool("tweet_cache_enabled", True):
+            cached = await self._cache_lookup(tweet_id)
+            if cached is not None:
+                chain = self._build_tweet_original(cached, user_name)
+                if chain:
+                    logger.info(f"tweet plugin: 命中缓存 tweet_id={tweet_id}")
+                    return ([event.chain_result(chain)], cached.get("translated") or None)
+
         rsshub_base_url = self._cfg_str(
             "rsshub_base_url",
             "https://rsshub.app/twitter/user/",
@@ -135,9 +165,23 @@ class TweetPlugin(Star):
             query = f"?{query}"
         rss_url = f"{rsshub_base_url.rstrip('/')}/{user_name}/status/{tweet_id}{query}"
 
+        event.set_extra(
+            "astrbot_plugin_tweet_ref",
+            {"user": user_name, "id": tweet_id, "link": original_link},
+        )
+
         tweet_data = await self._fetch_tweet_data(rss_url, original_link)
         if not tweet_data:
-            return ([event.plain_result("未能获取该推文。")], None)
+            # 原文解析失败：把推文渲染成图片兜底发送
+            event.set_extra("astrbot_plugin_tweet_card_only", True)
+            chain = await self._build_card_fallback_chain(
+                user_name=user_name,
+                tweet_id=tweet_id,
+                reason="feed_unavailable",
+                link=original_link,
+                fallback_text="未能获取该推文。",
+            )
+            return ([event.chain_result(chain)], None)
 
         if command == "content":
             chain = self._build_tweet_content_only(tweet_data)
@@ -183,15 +227,121 @@ class TweetPlugin(Star):
             elif video_urls:
                 chain = [Comp.Plain("检测到视频，正在发送视频消息...")]
             else:
-                chain = [Comp.Plain("该推文没有可发送的文本、图片或视频。")]
+                event.set_extra("astrbot_plugin_tweet_card_only", True)
+                chain = await self._build_card_fallback_chain(
+                    user_name=user_name,
+                    tweet_id=tweet_id,
+                    reason="empty_content",
+                    link=original_link,
+                    fallback_text="该推文没有可发送的文本、图片或视频。",
+                )
 
         translate_text = None
         if command is None:
             source_text = str(tweet_data.get("text") or "").strip()
             if source_text:
                 translate_text = source_text
+            if self._cfg_bool("tweet_cache_enabled", True):
+                # 后台翻译完成后落缓存，不阻塞原文发送
+                task = asyncio.create_task(
+                    self._translate_and_cache(user_name, tweet_id, tweet_data, source_text)
+                )
+                self._background_tasks.add(task)
+                task.add_done_callback(self._background_tasks.discard)
 
         return ([event.chain_result(chain)], translate_text)
+
+    # ---------- 推文缓存（1 天内相同推文直接复用原文 + 译文） ----------
+
+    def _cache_file(self) -> Path:
+        if self._cache_path is None:
+            try:
+                from astrbot.core.utils.astrbot_path import get_astrbot_data_path
+
+                base = Path(get_astrbot_data_path()) / "plugin_data" / "astrbot_plugin_tweet"
+            except Exception:
+                base = Path("/AstrBot/data/plugin_data/astrbot_plugin_tweet")
+            base.mkdir(parents=True, exist_ok=True)
+            self._cache_path = base / "tweet_cache.json"
+        return self._cache_path
+
+    def _cache_ttl_sec(self) -> int:
+        hours = self._cfg_int("tweet_cache_ttl_hours", 24)
+        return max(1, hours) * 3600
+
+    async def _cache_lookup(self, tweet_id: str) -> Optional[dict[str, Any]]:
+        """返回未过期的缓存条目；顺手清理过期条目。"""
+        async with self._cache_lock:
+            path = self._cache_file()
+            try:
+                data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+            except Exception:
+                data = {}
+            now = time.time()
+            ttl = self._cache_ttl_sec()
+            fresh = {k: v for k, v in data.items() if now - float(v.get("ts", 0)) < ttl}
+            if len(fresh) != len(data):
+                try:
+                    path.write_text(
+                        json.dumps(fresh, ensure_ascii=False), encoding="utf-8"
+                    )
+                except Exception as exc:
+                    logger.warning(f"tweet plugin: 清理缓存失败: {exc}")
+            entry = fresh.get(str(tweet_id))
+        if not entry:
+            return None
+        return {
+            "text": entry.get("text") or "",
+            "images": entry.get("images") or [],
+            "pub_date": entry.get("pub_date") or "",
+            "author": entry.get("author") or "",
+            "translated": entry.get("translated") or "",
+        }
+
+    async def _cache_store(
+        self,
+        user_name: str,
+        tweet_id: str,
+        tweet_data: dict[str, Any],
+        translated: str,
+    ) -> None:
+        async with self._cache_lock:
+            path = self._cache_file()
+            try:
+                data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+            except Exception:
+                data = {}
+            now = time.time()
+            ttl = self._cache_ttl_sec()
+            data = {k: v for k, v in data.items() if now - float(v.get("ts", 0)) < ttl}
+            data[str(tweet_id)] = {
+                "user": user_name,
+                "text": str(tweet_data.get("text") or ""),
+                "images": list(tweet_data.get("images") or []),
+                "pub_date": str(tweet_data.get("pub_date") or ""),
+                "author": str(tweet_data.get("author") or ""),
+                "translated": translated,
+                "ts": now,
+            }
+            try:
+                path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            except Exception as exc:
+                logger.warning(f"tweet plugin: 写入缓存失败: {exc}")
+
+    async def _translate_and_cache(
+        self,
+        user_name: str,
+        tweet_id: str,
+        tweet_data: dict[str, Any],
+        source_text: str,
+    ) -> None:
+        """后台任务：把原文和译文写入缓存，供 1 天内的重复推文直接复用。"""
+        translated = ""
+        if source_text:
+            # 主流程几乎同时发起翻译；稍等让它先占用 provider，再取自己的结果落库
+            await asyncio.sleep(2)
+            translated = await self._translate_text(umo="", text=source_text) or ""
+        await self._cache_store(user_name, tweet_id, tweet_data, translated)
 
     async def _handle_booth_link(
         self,
@@ -251,7 +401,7 @@ class TweetPlugin(Star):
     ) -> Optional[dict[str, Any]]:
         logger.debug(f"tweet plugin: fetching RSS data from {rss_url}")
         timeout = aiohttp.ClientTimeout(total=self._cfg_int("request_timeout_sec", 20))
-        headers = {"User-Agent": "astrbot-plugin-tweet/1.1"}
+        headers = {"User-Agent": "astrbot-plugin-tweet/1.2.0"}
 
         try:
             async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
@@ -348,7 +498,7 @@ class TweetPlugin(Star):
             total=self._cfg_int("request_timeout_sec", 20),
         )
         headers = {
-            "User-Agent": "astrbot-plugin-tweet/1.1",
+            "User-Agent": "astrbot-plugin-tweet/1.2.0",
             # fxtwitter may negotiate Brotli; avoid requiring an optional
             # brotli decoder in the host AstrBot environment.
             "Accept-Encoding": "identity",
@@ -438,6 +588,26 @@ class TweetPlugin(Star):
             )
         )
 
+    def _shrink_twimg_image_url(self, url: str) -> str:
+        """把 pbs.twimg.com 的原图降到 large 档，避免发送超时。
+
+        ``?name=orig`` 的原图动辄 4-8 MB（实测 2894x4093 = 4.28 MB），而 AstrBot
+        的 aiocqhttp 适配器还会把它整张转成 base64（体积 +33%）再推给 NapCat，
+        QQ 客户端超时就回 retcode=1200 Timeout，整条消息发不出去。同一张图
+        large 档约 323 KB，内容一致。
+        """
+        if not isinstance(url, str) or "pbs.twimg.com" not in url:
+            return url
+        if self._is_video_thumbnail_url(url):
+            # 视频/GIF 的静态封面只在视频发不出去时用到，保持原样
+            return url
+        if re.search(r"[?&]name=orig\b", url):
+            return re.sub(r"([?&]name=)orig\b", r"\1large", url)
+        if re.search(r"[?&]name=", url):
+            # 已经是别的档位，不重复改
+            return url
+        return url + ("&" if "?" in url else "?") + "name=large"
+
     def _is_related_video_thumbnail(
         self,
         image_url: str,
@@ -458,7 +628,7 @@ class TweetPlugin(Star):
     async def _resolve_twitter_link(self, tweet_id: str) -> Optional[tuple[str, str]]:
         api_url = f"https://api.vxtwitter.com/i/status/{tweet_id}"
         timeout = aiohttp.ClientTimeout(total=self._cfg_int("request_timeout_sec", 20))
-        headers = {"User-Agent": "astrbot-plugin-tweet/1.1"}
+        headers = {"User-Agent": "astrbot-plugin-tweet/1.2.0"}
 
         try:
             async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
@@ -483,7 +653,7 @@ class TweetPlugin(Star):
         booth_locale = self._cfg_str("booth_locale", "zh-cn")
         api_url = f"https://booth.pm/{booth_locale}/items/{item_id}.json"
         timeout = aiohttp.ClientTimeout(total=self._cfg_int("request_timeout_sec", 20))
-        headers = {"User-Agent": "astrbot-plugin-tweet/1.1"}
+        headers = {"User-Agent": "astrbot-plugin-tweet/1.2.0"}
 
         try:
             async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
@@ -573,7 +743,7 @@ class TweetPlugin(Star):
         output_path: Path,
     ) -> bool:
         timeout = aiohttp.ClientTimeout(total=self._cfg_int("request_timeout_sec", 20))
-        headers = {"User-Agent": "astrbot-plugin-tweet/1.1"}
+        headers = {"User-Agent": "astrbot-plugin-tweet/1.2.0"}
 
         try:
             async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
@@ -627,7 +797,7 @@ class TweetPlugin(Star):
 
         timeout = aiohttp.ClientTimeout(total=self._cfg_int("request_timeout_sec", 20))
         headers = {
-            "User-Agent": "astrbot-plugin-tweet/1.1",
+            "User-Agent": "astrbot-plugin-tweet/1.2.0",
             "Accept-Encoding": "identity",
         }
         try:
@@ -903,7 +1073,7 @@ class TweetPlugin(Star):
 
         api_url = "https://translate.googleapis.com/translate_a/single"
         timeout = aiohttp.ClientTimeout(total=self._cfg_int("request_timeout_sec", 20))
-        headers = {"User-Agent": "astrbot-plugin-tweet/1.1"}
+        headers = {"User-Agent": "astrbot-plugin-tweet/1.2.0"}
         params = {
             "client": "gtx",
             "sl": "auto",
@@ -1102,6 +1272,480 @@ class TweetPlugin(Star):
         )
         return None
 
+    # ---------------- 推文转图片兜底 ----------------
+
+    def _sanitize_card_text(self, text: str) -> str:
+        """去掉 Noto Sans CJK 无法渲染的 emoji 码位，避免图片里出现豆腐块。"""
+        kept = []
+        for char in text or "":
+            code = ord(char)
+            if code > 0xFFFF or code == 0x200D or 0xFE00 <= code <= 0xFE0F:
+                continue
+            # ✨✅❌ 等 BMP 区的符号/装饰字符同样不在 CJK 字体里
+            if 0x2600 <= code <= 0x27BF or 0x2B00 <= code <= 0x2BFF:
+                continue
+            kept.append(char)
+        return "".join(kept)
+
+    def _card_font_path(self) -> Optional[Path]:
+        plugin_dir = Path(__file__).resolve().parent
+        candidates = [
+            plugin_dir / "fonts" / "NotoSansCJKsc-Regular.otf",
+            plugin_dir / "fonts" / "NotoSansCJKsc-Regular.ttf",
+            Path(
+                "/AstrBot/data/plugin_data/astrbot_plugin_shoubanhua/fonts/"
+                "NotoSansCJKsc-Regular.otf"
+            ),
+            Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+        ]
+        for candidate in candidates:
+            try:
+                if candidate.exists():
+                    return candidate
+            except OSError:
+                continue
+        return None
+
+    def _card_output_dir(self) -> Path:
+        try:
+            from astrbot.api.star import StarTools
+
+            base = Path(StarTools.get_data_dir("astrbot_plugin_tweet"))
+        except Exception:
+            base = (
+                Path(__file__).resolve().parents[2]
+                / "plugin_data"
+                / "astrbot_plugin_tweet"
+            )
+        base.mkdir(parents=True, exist_ok=True)
+        return base
+
+    def _prune_card_files(self, keep_days: int = 7) -> None:
+        try:
+            cutoff = time.time() - keep_days * 86400
+            for path in self._card_output_dir().glob("card_*.png"):
+                try:
+                    if path.stat().st_mtime < cutoff:
+                        path.unlink()
+                except OSError:
+                    continue
+        except Exception:
+            return
+
+    async def _fetch_fxtwitter_tweet(
+        self, user_name: str, tweet_id: str
+    ) -> Optional[dict[str, Any]]:
+        """直接向 fxtwitter 取推文元数据（不依赖 RSSHub / LLM）。"""
+        api_url = f"https://api.fxtwitter.com/{user_name}/status/{tweet_id}"
+        timeout = aiohttp.ClientTimeout(total=self._cfg_int("request_timeout_sec", 20))
+        headers = {
+            "User-Agent": "astrbot-plugin-tweet/1.2.0",
+            "Accept-Encoding": "identity",
+        }
+        try:
+            async with aiohttp.ClientSession(
+                timeout=timeout, headers=headers
+            ) as session:
+                async with session.get(api_url) as response:
+                    if response.status >= 400:
+                        logger.warning(
+                            f"tweet plugin: 图片兜底取推文元数据 HTTP {response.status}: {api_url}"
+                        )
+                        return None
+                    payload = await response.json(content_type=None)
+        except Exception as exc:
+            logger.warning(f"tweet plugin: 图片兜底取推文元数据失败 {api_url} - {exc}")
+            return None
+
+        if not isinstance(payload, dict) or payload.get("code") != 200:
+            logger.warning(f"tweet plugin: 图片兜底拿到异常响应: {api_url}")
+            return None
+        tweet = payload.get("tweet")
+        return tweet if isinstance(tweet, dict) else None
+
+    async def _download_card_media(self, url: str) -> Optional[bytes]:
+        if not url:
+            return None
+        timeout = aiohttp.ClientTimeout(total=self._cfg_int("request_timeout_sec", 20))
+        headers = {
+            "User-Agent": "astrbot-plugin-tweet/1.2.0",
+            "Accept-Encoding": "identity",
+        }
+        try:
+            async with aiohttp.ClientSession(
+                timeout=timeout, headers=headers
+            ) as session:
+                async with session.get(url) as response:
+                    if response.status >= 400:
+                        logger.warning(
+                            f"tweet plugin: 图片兜底下载素材 HTTP {response.status}: {url}"
+                        )
+                        return None
+                    return await response.read()
+        except Exception as exc:
+            logger.warning(f"tweet plugin: 图片兜底下载素材失败 {url} - {exc}")
+            return None
+
+    def _format_card_date(self, raw: str) -> str:
+        raw = (raw or "").strip()
+        parsed: Optional[datetime] = None
+        for fmt in ("%a %b %d %H:%M:%S %z %Y", "%a, %d %b %Y %H:%M:%S %z"):
+            try:
+                parsed = datetime.strptime(raw, fmt)
+                break
+            except ValueError:
+                continue
+        if not parsed:
+            return ""
+        return parsed.astimezone(timezone(timedelta(hours=8))).strftime("%y-%m-%d %H:%M")
+
+    def _wrap_card_text(
+        self,
+        draw,
+        font,
+        text: str,
+        max_width: int,
+        max_lines: int = 34,
+    ) -> list[str]:
+        lines: list[str] = []
+        for paragraph in (text or "").split("\n"):
+            if not paragraph.strip():
+                lines.append("")
+                continue
+            current = ""
+            for char in paragraph:
+                candidate = current + char
+                if not current or draw.textlength(candidate, font=font) <= max_width:
+                    current = candidate
+                else:
+                    lines.append(current)
+                    current = char
+            lines.append(current)
+        while lines and not lines[-1].strip():
+            lines.pop()
+        if len(lines) > max_lines:
+            lines = lines[:max_lines]
+            if lines:
+                lines[-1] = lines[-1].rstrip() + "…"
+        return lines
+
+    def _fit_card_image(self, image, box_w: int, box_h: int):
+        from PIL import Image
+
+        ratio = min(box_w / max(image.width, 1), box_h / max(image.height, 1))
+        size = (
+            max(1, int(image.width * ratio)),
+            max(1, int(image.height * ratio)),
+        )
+        return image.resize(size, Image.LANCZOS)
+
+    def _compose_tweet_card(
+        self,
+        output_path: Path,
+        display_name: str,
+        screen_name: str,
+        text: str,
+        created_at: str,
+        avatar_bytes: Optional[bytes],
+        media_payloads: list,
+        font_path: Path,
+        tweet: dict[str, Any],
+    ) -> None:
+        from PIL import Image, ImageDraw, ImageFont, ImageOps
+
+        width = max(480, min(self._cfg_int("fallback_card_width", 720), 1200))
+        pad = 28
+        gap = 12
+        content_width = width - pad * 2
+
+        name_font = ImageFont.truetype(str(font_path), 30)
+        handle_font = ImageFont.truetype(str(font_path), 21)
+        body_font = ImageFont.truetype(str(font_path), 26)
+        meta_font = ImageFont.truetype(str(font_path), 20)
+
+        bg = (21, 32, 43)
+        cell_bg = (30, 41, 54)
+        text_color = (231, 233, 234)
+        name_color = (255, 255, 255)
+        dim_color = (136, 153, 166)
+        line_color = (47, 51, 54)
+
+        images = []
+        for payload, media_type in media_payloads:
+            try:
+                with Image.open(io.BytesIO(payload)) as handle:
+                    images.append((handle.convert("RGB").copy(), media_type))
+            except Exception as exc:
+                logger.warning(f"tweet plugin: 图片兜底素材解码失败 - {exc}")
+
+        image_count = len(images)
+        columns = 0 if image_count == 0 else (1 if image_count == 1 else 2)
+        rows = (image_count + columns - 1) // columns if columns else 0
+        cell_w = (content_width - gap * (columns - 1)) // columns if columns else 0
+        if columns == 1:
+            cell_h = min(int(cell_w * 1.33), 560)
+        else:
+            cell_h = min(cell_w, 340)
+
+        measure = ImageDraw.Draw(Image.new("RGB", (8, 8)))
+        header_text = f"@{screen_name}" + (f" · {created_at}" if created_at else "")
+        while header_text and measure.textlength(header_text, font=handle_font) > (
+            content_width - 100
+        ):
+            header_text = header_text[:-2]
+        footer_metrics = []
+        for label, key in (("赞", "likes"), ("转推", "retweets"), ("浏览", "views")):
+            value = tweet.get(key)
+            if isinstance(value, int) and value > 0:
+                footer_metrics.append(f"{label} {value:,}")
+        footer_text = " · ".join(footer_metrics)
+
+        body_lines: list[str] = []
+        if text:
+            body_lines = self._wrap_card_text(measure, body_font, text, content_width)
+        line_height = 40
+
+        header_h = 68
+        cursor = pad
+        body_y = cursor + header_h + (20 if body_lines else 0)
+        if body_lines:
+            cursor = body_y + line_height * len(body_lines)
+        else:
+            cursor = cursor + header_h
+        media_y = cursor + (22 if rows else 0)
+        if rows:
+            cursor = media_y + rows * cell_h + (rows - 1) * gap
+        footer_y = cursor + (24 if footer_text else 0)
+        height = footer_y + (26 + pad if footer_text else pad)
+
+        card = Image.new("RGB", (width, height), bg)
+        draw = ImageDraw.Draw(card)
+
+        if avatar_bytes:
+            try:
+                with Image.open(io.BytesIO(avatar_bytes)) as handle:
+                    avatar = ImageOps.fit(
+                        handle.convert("RGB"), (header_h, header_h), Image.LANCZOS
+                    )
+                mask = Image.new("L", (header_h, header_h), 0)
+                ImageDraw.Draw(mask).ellipse((0, 0, header_h - 1, header_h - 1), fill=255)
+                card.paste(avatar, (pad, pad), mask)
+            except Exception as exc:
+                logger.warning(f"tweet plugin: 图片兜底头像解码失败 - {exc}")
+        else:
+            draw.ellipse(
+                (pad, pad, pad + header_h - 1, pad + header_h - 1),
+                fill=cell_bg,
+            )
+
+        name_x = pad + header_h + 18
+        draw.text(
+            (name_x, pad + 4),
+            display_name,
+            font=name_font,
+            fill=name_color,
+            stroke_width=1,
+            stroke_fill=name_color,
+        )
+        draw.text(
+            (name_x, pad + 42),
+            header_text,
+            font=handle_font,
+            fill=dim_color,
+        )
+
+        for index, line in enumerate(body_lines):
+            draw.text(
+                (pad, body_y + index * line_height),
+                line,
+                font=body_font,
+                fill=text_color,
+            )
+
+        if rows:
+            for index, (image, _media_type) in enumerate(images):
+                row = index // columns
+                column = index % columns
+                cell_x = pad + column * (cell_w + gap)
+                cell_y = media_y + row * (cell_h + gap)
+                draw.rectangle(
+                    (cell_x, cell_y, cell_x + cell_w, cell_y + cell_h),
+                    fill=cell_bg,
+                )
+                fitted = self._fit_card_image(image, cell_w, cell_h)
+                card.paste(
+                    fitted,
+                    (
+                        cell_x + (cell_w - fitted.width) // 2,
+                        cell_y + (cell_h - fitted.height) // 2,
+                    ),
+                )
+
+        if footer_text:
+            draw.line((pad, footer_y, width - pad, footer_y), fill=line_color, width=1)
+            draw.text(
+                (pad, footer_y + 12),
+                footer_text,
+                font=meta_font,
+                fill=dim_color,
+            )
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        card.save(output_path, "PNG", optimize=True)
+
+    async def _render_card_from_ref(
+        self, user_name: str, tweet_id: str
+    ) -> Optional[Path]:
+        if not user_name or not tweet_id:
+            return None
+        tweet = await self._fetch_fxtwitter_tweet(user_name, tweet_id)
+        if not tweet:
+            return None
+
+        try:
+            from PIL import Image  # noqa: F401  仅用于提前确认依赖可用
+        except ImportError as exc:
+            logger.warning(f"tweet plugin: 图片兜底需要 Pillow: {exc}")
+            return None
+
+        font_path = self._card_font_path()
+        if not font_path:
+            logger.warning("tweet plugin: 图片兜底找不到可用字体")
+            return None
+
+        author = tweet.get("author") if isinstance(tweet.get("author"), dict) else {}
+        screen_name = str(author.get("screen_name") or user_name).strip() or user_name
+        display_name = str(author.get("name") or screen_name).strip() or screen_name
+        text = self._sanitize_card_text(str(tweet.get("text") or "").strip())
+        created_at = self._format_card_date(str(tweet.get("created_at") or ""))
+
+        media_items: list[tuple[str, str]] = []
+        media = tweet.get("media") if isinstance(tweet.get("media"), dict) else {}
+        for item in (media.get("all") or [])[:4]:
+            if not isinstance(item, dict):
+                continue
+            media_type = str(item.get("type") or "").strip().lower()
+            if media_type == "photo":
+                url = str(item.get("url") or "").strip()
+            else:
+                url = str(item.get("thumbnail_url") or "").strip()
+            if url:
+                media_items.append((url, media_type))
+
+        avatar_bytes = await self._download_card_media(
+            str(author.get("avatar_url") or "")
+        )
+        media_payloads = []
+        for url, media_type in media_items:
+            payload = await self._download_card_media(url)
+            if payload:
+                media_payloads.append((payload, media_type))
+
+        card_path = self._card_output_dir() / (
+            f"card_{tweet.get('id') or tweet_id}.png"
+        )
+        await asyncio.to_thread(
+            self._compose_tweet_card,
+            card_path,
+            display_name,
+            screen_name,
+            text,
+            created_at,
+            avatar_bytes,
+            media_payloads,
+            font_path,
+            tweet,
+        )
+        self._prune_card_files()
+        logger.info(
+            "tweet plugin: 已生成推文兜底图片 %s (%d bytes)",
+            card_path,
+            card_path.stat().st_size,
+        )
+        return card_path
+
+    def _card_caption(self, reason: str, link: str) -> str:
+        prefix = {
+            "feed_unavailable": "推文解析失败，已改成图片发送",
+            "empty_content": "推文没有可直接转发的媒体，已改成图片发送",
+            "send_failed": "原文发送超时，已改发图片",
+        }.get(reason, "推文已改成图片发送")
+        return f"{prefix}\n{link}\n" if link else f"{prefix}\n"
+
+    async def _build_card_fallback_chain(
+        self,
+        *,
+        user_name: str,
+        tweet_id: str,
+        reason: str,
+        link: str,
+        fallback_text: str,
+    ) -> list:
+        if not self._cfg_bool("fallback_image_enabled", True):
+            return [Comp.Plain(fallback_text)]
+        try:
+            card_path = await self._render_card_from_ref(user_name, tweet_id)
+        except Exception as exc:
+            logger.warning(f"tweet plugin: 图片兜底渲染异常 - {exc}")
+            card_path = None
+        if not card_path:
+            return [Comp.Plain(fallback_text)]
+        chain = [Comp.Plain(self._card_caption(reason, link))]
+        try:
+            chain.append(Comp.Image.fromFileSystem(card_path))
+        except Exception as exc:
+            logger.warning(f"tweet plugin: 图片兜底组件构建失败 - {exc}")
+            return [Comp.Plain(fallback_text)]
+        return chain
+
+    async def _send_card_fallback(
+        self,
+        *,
+        umo: str,
+        user_name: str,
+        tweet_id: str,
+        reason: str,
+        link: str,
+    ) -> None:
+        try:
+            await asyncio.sleep(2)
+            card_path = await self._render_card_from_ref(user_name, tweet_id)
+            if not card_path:
+                logger.warning(f"tweet plugin: 图片兜底渲染失败，放弃重发 {tweet_id}")
+                return
+            chain = [
+                Comp.Plain(self._card_caption(reason, link)),
+                Comp.Image.fromFileSystem(card_path),
+            ]
+            sent = await self.context.send_message(
+                umo, MessageChain(chain=chain)
+            )
+            if sent:
+                logger.info(f"tweet plugin: 图片兜底已发送 tweet={tweet_id}")
+            else:
+                logger.warning(f"tweet plugin: 图片兜底找不到会话 {umo}")
+        except Exception as exc:
+            logger.warning(f"tweet plugin: 图片兜底发送失败 - {exc}")
+
+    def _schedule_card_fallback(self, event: AstrMessageEvent, *, reason: str) -> None:
+        """发送失败后在后台渲染一张推文卡片补发。"""
+        if event.get_extra("astrbot_plugin_tweet_card_only"):
+            # 这一条本身就是兜底图片，再失败就放弃，避免无限兜底
+            logger.warning("tweet plugin: 兜底图片本身发送失败，不再重复兜底")
+            return
+        ref = event.get_extra("astrbot_plugin_tweet_ref") or {}
+        task = asyncio.create_task(
+            self._send_card_fallback(
+                umo=event.unified_msg_origin,
+                user_name=str(ref.get("user") or ""),
+                tweet_id=str(ref.get("id") or ""),
+                reason=reason,
+                link=str(ref.get("link") or ""),
+            )
+        )
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
     def _build_tweet_original(
         self,
         tweet_data: dict[str, Any],
@@ -1119,7 +1763,9 @@ class TweetPlugin(Star):
 
         for image_url in tweet_data.get("images", []):
             try:
-                chain.append(Comp.Image.fromURL(image_url))
+                chain.append(
+                    Comp.Image.fromURL(self._shrink_twimg_image_url(image_url))
+                )
             except Exception as exc:
                 logger.warning(f"tweet plugin: failed to build image component {image_url} - {exc}")
         return chain
@@ -1128,7 +1774,9 @@ class TweetPlugin(Star):
         chain = []
         for image_url in tweet_data.get("images", []):
             try:
-                chain.append(Comp.Image.fromURL(image_url))
+                chain.append(
+                    Comp.Image.fromURL(self._shrink_twimg_image_url(image_url))
+                )
             except Exception as exc:
                 logger.warning(f"tweet plugin: failed to build image component {image_url} - {exc}")
         return chain

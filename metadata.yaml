@@ -2,6 +2,6 @@ name: astrbot_plugin_tweet
 display_name: Tweet Forwarder
 desc: 基于 RSSHub 拉取 Twitter/X 推文并可用 AstrBot 内置 LLM 翻译，支持媒体元数据兜底、动图转 GIF 与 BOOTH 商品信息抓取。
 help: https://github.com/icrazt/astrbot_plugin_tweet
-version: v1.1
+version: v1.2.0
 author: crazt
 repo: https://github.com/icrazt/astrbot_plugin_tweet

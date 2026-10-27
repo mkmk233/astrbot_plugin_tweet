@@ -103,5 +103,28 @@
     "type": "int",
     "hint": "用于 RSSHub、vxtwitter、BOOTH 拉取请求。",
     "default": 20
+  },
+  "fallback_image_enabled": {
+    "description": "推文解析失败或原文发送失败时，把推文渲染成图片兜底发送。",
+    "type": "bool",
+    "hint": "默认开启。兜底图片由插件用 fxtwitter 元数据在本地用 Pillow 渲染，不依赖 RSSHub 和翻译模型。",
+    "default": true
+  },
+  "fallback_card_width": {
+    "description": "兜底图片宽度（像素）。",
+    "type": "int",
+    "hint": "默认 720，允许 480-1200。",
+    "default": 720
+  },
+  "tweet_cache_enabled": {
+    "description": "缓存已处理的推文（原文+翻译），1天内相同推文被再次发送时直接复用缓存，不再请求 RSSHub 和翻译模型。",
+    "type": "bool",
+    "default": true
+  },
+  "tweet_cache_ttl_hours": {
+    "description": "推文缓存有效期（小时）。",
+    "type": "int",
+    "hint": "默认 24 小时。",
+    "default": 24
   }
 }
