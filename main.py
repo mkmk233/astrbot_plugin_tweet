@@ -80,8 +80,21 @@ class TweetPlugin(Star):
             # 以前"原文无文字"的推文直接 yield 给 respond 阶段发送，插件拿不到
             # 发送结果：NapCat 超时（retcode=1200）时消息根本进不了群，却没有任何
             # 兜底。这里和带文字的分支统一成"插件自发送 + 失败改发卡片图片"。
-            for result in tweet_results:
-                chain = MessageChain(chain=list(getattr(result, "chain", []) or []))
+            chains = [
+                list(getattr(result, "chain", []) or [])
+                for result in tweet_results
+            ]
+            image_count = sum(
+                isinstance(segment, Comp.Image)
+                for parts in chains
+                for segment in parts
+            )
+            # 三张及以上图片时将推文内容合并为一条消息，避免逐图刷屏。
+            if image_count >= 3:
+                chains = [[segment for parts in chains for segment in parts]]
+
+            for parts in chains:
+                chain = MessageChain(chain=parts)
                 if not chain.chain:
                     continue
                 try:
